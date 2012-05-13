@@ -177,6 +177,7 @@ sub update_pagerduty {
 	$ua->timeout(15);
 	my $res = $ua->request($req);
 	if ($res->is_success) {
+		syslog(LOG_INFO, "Zenoss event id %s ACCEPTED by the PagerDuty server. [%s]", $event->{'incident_key'}, $event->{'description'});
 		return 0;
 	} else {
 		my $response = JSON->new->utf8(1)->decode($res->content);
