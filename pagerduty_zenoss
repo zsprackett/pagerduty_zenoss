@@ -1,0 +1,231 @@
+#!/usr/bin/perl -w
+# Zenoss command that sends Zenoss events to PagerDuty.
+#
+# Ported from pagerduty_nagios.pl
+# Copyright (c) 2011, PagerDuty, Inc. <info@pagerduty.com>
+# Copyright (c) 2012, S. Zachariah Sprackett <zac@sprackett.com>
+# All rights reserved.
+#.
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#     * Redistributions of source code must retain the above copyright
+#       notice, this list of conditions and the following disclaimer.
+#     * Redistributions in binary form must reproduce the above copyright
+#       notice, this list of conditions and the following disclaimer in the
+#       documentation and/or other materials provided with the distribution.
+#     * Neither the name of PagerDuty Inc nor the
+#       names of its contributors may be used to endorse or promote products
+#       derived from this software without specific prior written permission.
+#.
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+# ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+# WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+# DISCLAIMED. IN NO EVENT SHALL PAGERDUTY INC BE LIABLE FOR ANY
+# DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+# (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+# LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+# ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+# SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+=head1 NAME
+
+pagerduty_zenoss -- Send Zenoss events to the PagerDuty alert system
+
+=head1 SYNOPSIS
+
+pagerduty_zenoss --action <action> --apikey <apikey> --description <desc> --incidentkey <identifier>
+
+pagerduty_zenoss --action flush --apikey <apikey>
+
+=head1 DESCRIPTION
+
+  This script passes events from Zenoss to the PagerDuty alert system. It's
+  meant to be run as a Zenoss command. For more details, please see
+  the PagerDuty Zenoss integration docs at:
+  http://www.pagerduty.com/docs/nagios-integration.
+
+  When called in the trigger, acknowledge or resolve modes, the script loads a 
+  Zenoss notification from the commandline into the event queue.  It then tries to flush the
+  queue by sending any enqueued events to the PagerDuty server.  The script is
+  typically invoked in this mode as a Zenoss command.
+
+  When called in the "flush" mode, the script simply tries to send any enqueued
+  events to the PagerDuty server.  This mode is typically invoked by cron.  The
+  purpose of this mode is to retry any events that couldn't be sent to the
+  PagerDuty server for whatever reason when they were initially enqueued.
+
+=head1 OPTIONS
+
+  --apikey "PagerDuty API Key"
+  --description "Description of this alert"
+  --action "Mode can be one of trigger, acknowledge, resolve or flush"
+  --incidentkey "Unique ID for this incident"
+  --help
+  --verbose
+
+=cut
+
+use Pod::Usage;
+use JSON;
+use HTTP::Request;
+use LWP::UserAgent;
+use Getopt::Long;
+use Sys::Syslog;
+use HTTP::Status qw(is_client_error);
+use File::Path;
+use Fcntl qw(:flock);
+use Data::Dumper;
+
+my $url = "https://events.pagerduty.com/generic/2010-04-15/create_event.json";
+my $opt_queue_dir = "/tmp/pagerduty_zenoss";
+
+my %opt;
+my %opt_fields;
+my $opt_apikey;
+my $opt_help;
+my $opt_verbose;
+
+sub get_queue_from_dir {
+        my $dh; 
+        
+        unless (opendir($dh, $opt_queue_dir)) {
+                syslog(LOG_ERR, "opendir %s failed: %s", $opt_queue_dir, $!);
+                die $!;
+        }
+        
+        my @files;
+        while (my $f = readdir($dh)) { 
+                next unless $f =~ /^pd_(\d+)_\d+\.txt$/;
+                push @files, [int($1), $f];
+        }
+
+        closedir($dh);
+
+        @files = sort { @{$a}[0] <=> @{$b}[0] } @files;
+        return map { @{$_}[1] } @files;
+}
+
+sub flush_queue {
+	my $lock_filename = "$opt_queue_dir/lockfile";
+	my $lock_fd;
+
+	unless (open($lock_fd, ">", $lock_filename)) {
+		syslog(LOG_ERR, "open %s for write failed: %s", $lock_filename, $!);
+		die $!;
+	}
+
+	unless (flock($lock_fd, LOCK_EX)) {
+		syslog(LOG_ERR, "flock %s failed: %s", $lock_filename, $!);
+		die $!;
+	}
+
+	my @files = get_queue_from_dir();
+
+	foreach (@files) {
+		my $filename = "$opt_queue_dir/$_";
+		my $fd;
+		my $event;
+
+		print STDERR "==== Now processing: $filename\n" if $opt_verbose;
+
+		unless (open($fd, "<", $filename)) {
+			syslog(LOG_ERR, "open %s for read failed: %s", $filename, $!);
+			die $!;
+		}
+		my $contents;
+		while(<$fd>) {
+			chomp;
+			$contents .= $_;
+		}
+		close($fd);
+
+		$event = JSON->new->utf8(1)->decode($contents);
+
+		if (!update_pagerduty($event)) {
+			unlink($filename);
+		}
+	}
+
+	close($lock_fd);
+}
+
+sub enqueue_event {
+	my $filename = sprintf("$opt_queue_dir/pd_%u_%u.txt", time(), $$);
+	my $fd;
+
+	unless (open($fd, ">", $filename)) {
+		syslog(LOG_ERR, "open %s for write failed: %s", $filename, $!);
+		die $!;
+	} 
+
+	print $fd JSON->new->utf8(1)->pretty(1)->encode(\%opt);
+	close($fd);
+}
+
+sub update_pagerduty {
+	my $event = shift;
+	$event->{'service_key'} = $opt_apikey;
+
+	my $req = HTTP::Request->new(POST => $url);
+	$req->content_type('application/json');
+	$req->content(JSON->new->utf8(1)->encode($event));
+
+	print Dumper($event) if $opt_verbose;
+
+	my $ua = LWP::UserAgent->new;
+	$ua->timeout(15);
+	my $res = $ua->request($req);
+	if ($res->is_success) {
+		return 0;
+	} else {
+		my $response = JSON->new->utf8(1)->decode($res->content);
+		syslog(LOG_ERR, "pagerduty replied: %s", $response->{'status'});
+		return 1;
+	}
+}
+
+GetOptions(
+	"apikey=s" => \$opt_apikey,
+	"description=s" => \$opt{'description'},
+	"action=s" => \$opt{'event_type'},
+	"field=s%" => \%opt_fields,
+	"incidentkey=s" => \$opt{'incident_key'},
+	"help" => \$opt_help,
+	"verbose" => \$opt_verbose
+) || pod2usage(-verbose => 2);
+
+pod2usage(-verbose => 3) if $opt_help;
+
+if (length(keys(%opt_fields)) > 0) {
+	$opt{'details'} = \%opt_fields;
+}
+
+pod2usage(-verbose => 2) unless $opt{'event_type'} and $opt_apikey;
+
+my @log_mode = ("nofatal", "pid");
+push(@log_mode, "perror") if $opt_verbose;
+
+openlog($0, join(",", @log_mode), LOG_LOCAL0);
+mkpath($opt_queue_dir);
+
+if ($opt{'event_type'} eq 'acknowledge') {
+	$opt{'description'} = 'Acknowledged by Zenoss' if (!$opt{'description'});
+} elsif ($opt{'event_type'} eq 'resolve') {
+	$opt{'description'} = 'Resolved by Zenoss' if (!$opt{'description'});
+}
+
+if ($opt{'event_type'} eq 'trigger' or $opt{'event_type'} eq 'acknowledge' or $opt{'event_type'} eq 'resolve') {
+
+	if (!$opt_apikey or !$opt{'description'} or !$opt{'event_type'}, or !$opt{'incident_key'}) {
+		pod2usage(-verbose => 3);
+	}
+
+	enqueue_event();
+	flush_queue();
+} elsif ($opt{'event_type'} eq 'flush') {
+	flush_queue();
+} else {
+	die;
+}
+exit 0;
